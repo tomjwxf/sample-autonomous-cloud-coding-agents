@@ -21,6 +21,7 @@ import { ApplyGuardrailCommand, BedrockRuntimeClient } from '@aws-sdk/client-bed
 import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import { logger } from './logger';
 import { loadMemoryContext, type MemoryContext } from './memory';
+import { sanitizeExternalContent } from './sanitization';
 import { isPrTaskType, type TaskRecord, type TaskType } from './types';
 
 // ---------------------------------------------------------------------------
@@ -89,6 +90,19 @@ export interface GitHubPullRequestContext {
 }
 
 /**
+ * Trust classification for content sources in the hydrated context.
+ * - 'trusted': authenticated user input (task_description — screened by guardrail at
+ *   submission, additionally sanitized during prompt assembly). Lower risk than external
+ *   sources but not exempt from defense-in-depth sanitization.
+ * - 'untrusted-external': GitHub issues, PR bodies/comments (attacker-controllable,
+ *   sanitized + guardrail screened). Some PR sub-fields are not sanitized:
+ *   diff_hunk and diff_summary (code/patch content in markdown code blocks),
+ *   path (file paths), head_ref and base_ref (branch names).
+ * - 'memory': memory records (sanitized, integrity-hashed)
+ */
+export type ContentTrustLevel = 'trusted' | 'untrusted-external' | 'memory';
+
+/**
  * The result of the context hydration pipeline.
  */
 export interface HydratedContext {
@@ -103,6 +117,7 @@ export interface HydratedContext {
   readonly guardrail_blocked?: string;
   readonly resolved_branch_name?: string;
   readonly resolved_base_branch?: string;
+  readonly content_trust?: Readonly<Record<string, ContentTrustLevel>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -297,7 +312,7 @@ export function clearTokenCache(): void {
 /**
  * Fetch a GitHub issue's title, body, and comments via the REST API.
  * Returns null on any error (logged).
- * Mirrors agent/entrypoint.py:fetch_github_issue.
+ * Mirrors agent/src/context.py:fetch_github_issue.
  * @param repo - the "owner/repo" string.
  * @param issueNumber - the issue number.
  * @param token - the GitHub PAT.
@@ -708,7 +723,7 @@ export function enforceTokenBudget(
 
 /**
  * Assemble the user prompt from issue context and task description.
- * Mirrors agent/entrypoint.py:assemble_prompt exactly.
+ * Mirrors agent/src/context.py:assemble_prompt.
  * @param taskId - the task ID.
  * @param repo - the "owner/repo" string.
  * @param issue - the GitHub issue context (optional).
@@ -727,18 +742,18 @@ export function assembleUserPrompt(
   parts.push(`Repository: ${repo}`);
 
   if (issue) {
-    parts.push(`\n## GitHub Issue #${issue.number}: ${issue.title}\n`);
-    parts.push(issue.body || '(no description)');
+    parts.push(`\n## GitHub Issue #${issue.number}: ${sanitizeExternalContent(issue.title)}\n`);
+    parts.push(sanitizeExternalContent(issue.body) || '(no description)');
     if (issue.comments.length > 0) {
       parts.push('\n### Comments\n');
       for (const c of issue.comments) {
-        parts.push(`**@${c.author}**: ${c.body}\n`);
+        parts.push(`**@${sanitizeExternalContent(c.author)}**: ${sanitizeExternalContent(c.body)}\n`);
       }
     }
   }
 
   if (taskDescription) {
-    parts.push(`\n## Task\n\n${taskDescription}`);
+    parts.push(`\n## Task\n\n${sanitizeExternalContent(taskDescription)}`);
   } else if (issue) {
     parts.push(
       '\n## Task\n\nResolve the GitHub issue described above. '
@@ -767,8 +782,8 @@ export function assemblePrIterationPrompt(
 
   parts.push(`Task ID: ${taskId}`);
   parts.push(`Repository: ${repo}`);
-  parts.push(`\n## Pull Request #${pr.number}: ${pr.title}\n`);
-  parts.push(pr.body || '(no description)');
+  parts.push(`\n## Pull Request #${pr.number}: ${sanitizeExternalContent(pr.title)}\n`);
+  parts.push(sanitizeExternalContent(pr.body) || '(no description)');
   parts.push(`\nBase branch: ${pr.base_ref}`);
   parts.push(`Head branch: ${pr.head_ref}`);
 
@@ -806,13 +821,15 @@ export function assemblePrIterationPrompt(
     for (const [rootId, root] of rootComments) {
       const location = root.path ? `\`${root.path}${root.line ? `:${root.line}` : ''}\`` : 'general';
       parts.push(`**Thread on ${location}** (reply with comment_id: ${rootId})`);
-      parts.push(`> **@${root.author}**: ${root.body}`);
+      parts.push(`> **@${sanitizeExternalContent(root.author)}**: ${sanitizeExternalContent(root.body)}`);
+      // diff_hunk and path are not sanitized: they contain code content inside markdown
+      // code blocks, and sanitizing them could corrupt legitimate code snippets.
       if (root.diff_hunk) {
         parts.push(`> \`\`\`diff\n> ${root.diff_hunk}\n> \`\`\``);
       }
       const threadReplies = replies.get(rootId) ?? [];
       for (const r of threadReplies) {
-        parts.push(`\n  - **@${r.author}**: ${r.body}`);
+        parts.push(`\n  - **@${sanitizeExternalContent(r.author)}**: ${sanitizeExternalContent(r.body)}`);
       }
       parts.push('');
     }
@@ -824,7 +841,7 @@ export function assemblePrIterationPrompt(
         const location = r.path ? `\`${r.path}${r.line ? `:${r.line}` : ''}\`` : 'general';
         const replyTarget = r.in_reply_to_id ?? r.id;
         parts.push(`**Comment on ${location}** (reply with comment_id: ${replyTarget})`);
-        parts.push(`> **@${r.author}**: ${r.body}`);
+        parts.push(`> **@${sanitizeExternalContent(r.author)}**: ${sanitizeExternalContent(r.body)}`);
         if (r.diff_hunk) {
           parts.push(`> \`\`\`diff\n> ${r.diff_hunk}\n> \`\`\``);
         }
@@ -836,7 +853,7 @@ export function assemblePrIterationPrompt(
   if (pr.issue_comments.length > 0) {
     parts.push('\n### Conversation Comments\n');
     for (const c of pr.issue_comments) {
-      parts.push(`**@${c.author}** (comment_id: ${c.id}): ${c.body}\n`);
+      parts.push(`**@${sanitizeExternalContent(c.author)}** (comment_id: ${c.id}): ${sanitizeExternalContent(c.body)}\n`);
     }
   }
 
@@ -846,7 +863,7 @@ export function assemblePrIterationPrompt(
   }
 
   if (taskDescription) {
-    parts.push(`\n## Additional Instructions\n\n${taskDescription}`);
+    parts.push(`\n## Additional Instructions\n\n${sanitizeExternalContent(taskDescription)}`);
   } else {
     parts.push(
       '\n## Task\n\nAddress the review feedback on this pull request. '
@@ -855,6 +872,44 @@ export function assemblePrIterationPrompt(
   }
 
   return parts.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Content trust classification
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the content_trust record from the sources list.
+ * Maps each source to its trust classification:
+ * - 'issue', 'pull_request' → 'untrusted-external'
+ * - 'memory' → 'memory'
+ * - 'task_description' → 'trusted'
+ * Unknown sources default to 'untrusted-external' (fail-safe).
+ */
+export function buildContentTrust(sources: string[]): Record<string, ContentTrustLevel> {
+  const trust: Record<string, ContentTrustLevel> = {};
+  for (const source of sources) {
+    switch (source) {
+      case 'issue':
+      case 'pull_request':
+        trust[source] = 'untrusted-external';
+        break;
+      case 'memory':
+        trust[source] = 'memory';
+        break;
+      case 'task_description':
+        trust[source] = 'trusted';
+        break;
+      default:
+        logger.warn('Unknown content source — defaulting to untrusted-external', {
+          source,
+          metric_type: 'unknown_content_source',
+        });
+        trust[source] = 'untrusted-external';
+        break;
+    }
+  }
+  return trust;
 }
 
 // ---------------------------------------------------------------------------
@@ -961,13 +1016,15 @@ export async function hydrateContext(task: TaskRecord, options?: HydrateContextO
           task_id: task.task_id, pr_number: task.pr_number, task_type: task.task_type,
         });
         const fallbackPrompt = assembleUserPrompt(task.task_id, task.repo, undefined, task.task_description);
+        const fallbackSources = task.task_description ? ['task_description'] : [];
         return {
           version: 1,
           user_prompt: fallbackPrompt,
-          sources: task.task_description ? ['task_description'] : [],
+          sources: fallbackSources,
           token_estimate: estimateTokens(fallbackPrompt),
           truncated: false,
           fallback_error: `Failed to fetch PR #${task.pr_number} context from GitHub`,
+          content_trust: buildContentTrust(fallbackSources),
         };
       }
 
@@ -1064,6 +1121,7 @@ export async function hydrateContext(task: TaskRecord, options?: HydrateContextO
         sources,
         token_estimate: estimateTokens(userPrompt),
         truncated,
+        content_trust: buildContentTrust(sources),
         ...(guardrailBlocked && { guardrail_blocked: guardrailBlocked }),
       };
 
@@ -1093,6 +1151,7 @@ export async function hydrateContext(task: TaskRecord, options?: HydrateContextO
       sources,
       token_estimate: tokenEstimate,
       truncated: budgetResult.truncated,
+      content_trust: buildContentTrust(sources),
       ...(guardrailBlocked && { guardrail_blocked: guardrailBlocked }),
     };
   } catch (err) {
@@ -1100,18 +1159,32 @@ export async function hydrateContext(task: TaskRecord, options?: HydrateContextO
     if (err instanceof GuardrailScreeningError) {
       throw err;
     }
-    // Fallback: minimal context from task_description only
-    logger.error('Unexpected error during context hydration', {
-      task_id: task.task_id, error: err instanceof Error ? err.message : String(err),
+    // Programming errors (bugs) should fail the task, not silently degrade context
+    if (err instanceof TypeError || err instanceof RangeError || err instanceof ReferenceError) {
+      logger.error('Programming error during context hydration — failing task', {
+        task_id: task.task_id,
+        error: err instanceof Error ? err.message : String(err),
+        error_type: err.constructor.name,
+        metric_type: 'hydration_bug',
+      });
+      throw err;
+    }
+    // Infrastructure failures — fallback to minimal context from task_description only
+    logger.error('Infrastructure error during context hydration — falling back to minimal context', {
+      task_id: task.task_id,
+      error: err instanceof Error ? err.message : String(err),
+      metric_type: 'hydration_infra_failure',
     });
     const fallbackPrompt = assembleUserPrompt(task.task_id, task.repo, undefined, task.task_description);
+    const fallbackSources = task.task_description ? ['task_description'] : [];
     return {
       version: 1,
       user_prompt: fallbackPrompt,
-      sources: task.task_description ? ['task_description'] : [],
+      sources: fallbackSources,
       token_estimate: estimateTokens(fallbackPrompt),
       truncated: false,
       fallback_error: err instanceof Error ? err.message : String(err),
+      content_trust: buildContentTrust(fallbackSources),
     };
   }
 }

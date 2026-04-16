@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from config import AGENT_WORKSPACE
 from prompts import get_system_prompt
+from sanitization import sanitize_external_content as sanitize_memory_content
 from shell import log
 from system_prompt import SYSTEM_PROMPT
 
@@ -49,11 +50,11 @@ def build_system_prompt(
         if mc.repo_knowledge:
             mc_parts.append("**Repository knowledge:**")
             for item in mc.repo_knowledge:
-                mc_parts.append(f"- {item}")
+                mc_parts.append(f"- {sanitize_memory_content(item)}")
         if mc.past_episodes:
             mc_parts.append("\n**Past task episodes:**")
             for item in mc.past_episodes:
-                mc_parts.append(f"- {item}")
+                mc_parts.append(f"- {sanitize_memory_content(item)}")
         if mc_parts:
             memory_context_text = "\n".join(mc_parts)
     system_prompt = system_prompt.replace("{memory_context}", memory_context_text)
